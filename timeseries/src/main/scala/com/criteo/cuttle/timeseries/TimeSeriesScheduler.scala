@@ -34,10 +34,11 @@ object TimeSeriesGrid {
   implicit val gridEncoder = new Encoder[TimeSeriesGrid] {
     override def apply(grid: TimeSeriesGrid) = grid match {
       case Hourly => Json.obj("period" -> "hourly".asJson)
-      case Daily(tz: ZoneId) => Json.obj(
-        "period" -> "daily".asJson,
-        "zoneId" -> tz.getId().asJson
-      )
+      case Daily(tz: ZoneId) =>
+        Json.obj(
+          "period" -> "daily".asJson,
+          "zoneId" -> tz.getId().asJson
+        )
       case Continuous => Json.obj("period" -> "continuuous".asJson)
     }
   }
