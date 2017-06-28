@@ -18,7 +18,25 @@ object IntervalMap {
   }
   private implicit def measure[A, B] = new MeasureKey[Interval[A], B]
 
-  case class Interval[V](lo: V, hi: V)
+  sealed trait Bound[+V]
+  case object Bottom extends Bound[Nothing]
+  case object Top extends Bound[Nothing]
+  case class Left[V](bound: V) extends Bound[V]
+  case class Right[V](bound: V) extends Bound[V]
+  object Bound {
+    implicit def ordering[V: Ordering]: Ordering[Bound[V]] =
+      Ordering.by[Bound[V], (Int, Option[(V, Int)])] {
+        case Bottom => (-1, None)
+        case Top => (1, None)
+        case Left(v) => (0, Some((v, -1)))
+        case Right(v) => (0, Some((v, 1)))
+      }
+  }
+
+  case class Interval[V: Ordering](lo: Bound[V], hi: Bound[V]) {
+    if (lo >= hi)
+      throw new IllegalArgumentException("low bound must be smaller than high bound")
+  }
   private type Elem[A, B] = (Interval[A], B)
 
   def apply[A: Ordering, B](elems: Elem[A, B]*): IntervalMap[A, B] = {
