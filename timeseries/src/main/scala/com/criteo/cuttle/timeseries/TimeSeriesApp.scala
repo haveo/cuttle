@@ -28,12 +28,17 @@ private[timeseries] trait TimeSeriesApp { self: TimeSeriesScheduler =>
   import App._
 
   private implicit val intervalEncoder = new Encoder[Interval[Instant]] {
+    implicit val boundEncoder = new Encoder[Bound[Instant]] {
+      override def apply(bound: Bound[Instant]) = bound match {
+        case Bottom => "-oo".asJson
+        case Top => "+oo".asJson
+        case Finite(t) => t.asJson
+      }
+    }
     override def apply(interval: Interval[Instant]) = {
-      val Closed(start) = interval.lower.bound
-      val Open(end) = interval.upper.bound
       Json.obj(
-        "start" -> start.asJson,
-        "end" -> end.asJson
+        "start" -> interval.lo.asJson,
+        "end" -> interval.hi.asJson
       )
     }
   }
