@@ -11,7 +11,7 @@ object HelloWorld {
 
   def main(args: Array[String]): Unit = {
     // 7 days ago at 00:00 UTC
-    val start: Instant = LocalDate.now.minusDays(7).atStartOfDay.toInstant(UTC)
+    val start: Instant = LocalDate.now.minusDays(1).atStartOfDay.toInstant(UTC)
 
     val hello1 =
       Job("hello1", hourly(start)) { implicit e =>
@@ -25,7 +25,7 @@ object HelloWorld {
       Job("hello2", hourly(start)) { implicit e =>
         sh"""
           echo "Looping for 20 seconds..."
-          for i in {1..20}; do
+          for i in {1..2}; do
             date
             sleep 1
           done
@@ -37,7 +37,7 @@ object HelloWorld {
       Job("hello3", hourly(start), tags = Set(Tag("unsafe job"))) { implicit e =>
         sh"""
           echo "Hello 3"
-          sleep 3
+          sleep 1
         """.exec().map { _ =>
           // Artificially fail for 2 days ago 00 to 01
           // if /tmp/hello3_success does not exist

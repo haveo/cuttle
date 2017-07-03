@@ -10,8 +10,6 @@ import scala.concurrent.stm._
 
 import cats.implicits._
 
-import algebra.lattice.Bool._
-
 import io.circe._
 import io.circe.syntax._
 import io.circe.generic.semiauto._
@@ -22,11 +20,51 @@ import java.time._
 import java.time.temporal.ChronoUnit._
 import java.time.temporal._
 
-sealed trait TimeSeriesGrid
+sealed trait TimeSeriesGrid {
+  def next(t: Instant): Instant
+  def truncate(t: Instant): Instant
+  def ceil(t: Instant): Instant = {
+    val truncated = truncate(t)
+    if (truncated == t) t
+    else next(t)
+  }
+  def inInterval(interval: Interval[Instant], maxPeriods: Int) = {
+    def go(lo: Instant, hi: Instant): List[(Instant, Instant)] = {
+      val nextLo = next(lo)
+      if (nextLo.isAfter(hi)) List.empty
+      else ((lo, nextLo) +: go(nextLo, hi))
+    }
+    interval match {
+      case Interval(Finite(lo), Finite(hi)) =>
+        go(ceil(lo), hi).grouped(maxPeriods).map(xs => (xs.head._1, xs.last._2))
+    }
+  }
+  def split(interval: Interval[Instant]) = {
+    def go(lo: Instant, hi: Instant): List[(Instant, Instant)] = {
+      val nextLo = next(lo)
+      if (nextLo.isBefore(hi)) ((lo, nextLo) +: go(nextLo, hi))
+      else List((lo, hi))
+    }
+    interval match {
+      case Interval(Finite(lo), Finite(hi)) =>
+        go(lo, hi)
+    }
+  }
+}
 object TimeSeriesGrid {
-  case object Hourly extends TimeSeriesGrid
-  case class Daily(tz: ZoneId) extends TimeSeriesGrid
-  private[timeseries] case object Continuous extends TimeSeriesGrid
+  case object Hourly extends TimeSeriesGrid {
+    def truncate(t: Instant) = t.truncatedTo(HOURS)
+    def next(t: Instant) =
+      t.truncatedTo(HOURS).plus(1, HOURS)
+  }
+  case class Daily(tz: ZoneId) extends TimeSeriesGrid {
+    def truncate(t: Instant) = t.atZone(tz).truncatedTo(DAYS).toInstant
+    def next(t: Instant) = t.atZone(tz).truncatedTo(DAYS).plus(1, DAYS).toInstant
+  }
+  private[timeseries] case object Continuous extends TimeSeriesGrid {
+    def next(t: Instant) = ???
+    def truncate(t: Instant) = ???
+  }
 
   implicit val gridEncoder = new Encoder[TimeSeriesGrid] {
     override def apply(grid: TimeSeriesGrid) = grid match {
@@ -113,8 +151,12 @@ case class TimeSeriesScheduler() extends Scheduler[TimeSeries] with TimeSeriesAp
 
   private val _backfills = TSet.empty[Backfill]
 
-  private[timeseries] def state: (State, Set[Backfill]) = atomic { implicit txn =>
-    (_state(), _backfills.snapshot)
+  private[timeseries] def state: (State, IntervalMap[Instant, Unit]) = atomic { implicit txn =>
+    val backfillDomain =
+      _backfills.snapshot.foldLeft(IntervalMap.empty[Instant, Unit]) { (acc, bf) =>
+        acc.update(Interval(bf.start, bf.end), ())
+      }
+    (_state(), backfillDomain)
   }
 
   private[timeseries] def backfillJob(id: String,
@@ -163,7 +205,7 @@ case class TimeSeriesScheduler() extends Scheduler[TimeSeries] with TimeSeriesAp
     atomic { implicit txn =>
       workflow.vertices.foreach { job =>
         if (!_state().contains(job)) {
-          _state() = _state() + (job -> IntervalMap.empty)
+          _state() = _state() + (job -> IntervalMap(Interval(Finite(job.scheduling.start), Top) -> Todo(None)))
         }
       }
     }
@@ -193,17 +235,17 @@ case class TimeSeriesScheduler() extends Scheduler[TimeSeries] with TimeSeriesAp
       atomic { implicit txn =>
         newExecutions.foldLeft(_state()) { (st, x) =>
           val (execution, result) = x
-            st + (execution.job ->
-              st(execution.job).update(execution.context.toInterval, Running(execution.id)))
+          st + (execution.job ->
+            st(execution.job).update(execution.context.toInterval, Running(execution.id)))
         }
       }
 
-     // if (completed.nonEmpty || toRun.nonEmpty)
-     //   Database.serialize(stateSnapshot, backfillSnapshot).transact(xa).unsafePerformIO
+      // if (completed.nonEmpty || toRun.nonEmpty)
+      //   Database.serialize(stateSnapshot, backfillSnapshot).transact(xa).unsafePerformIO
 
-
-      val newRunning = stillRunning ++ newExecutions.map { case (execution, result) =>
-        (execution.job, execution.context, result)
+      val newRunning = stillRunning ++ newExecutions.map {
+        case (execution, result) =>
+          (execution.job, execution.context, result)
       }
 
       Future.firstCompletedOf(utils.Timeout(ScalaDuration.create(1, "s")) :: newRunning.map(_._3).toList).andThen {
@@ -214,87 +256,40 @@ case class TimeSeriesScheduler() extends Scheduler[TimeSeries] with TimeSeriesAp
     go(Set.empty)
   }
 
-  private[timeseries] def split(start: Instant,
-                                end: Instant,
-                                tz: ZoneId,
-                                unit: ChronoUnit,
-                                conservative: Boolean,
-                                maxPeriods: Int): Iterator[TimeSeriesContext] = {
-    val List(zonedStart, zonedEnd) = List(start, end).map { t =>
-      t.atZone(UTC).withZoneSameInstant(tz)
-    }
-
-    def findBound(t: ZonedDateTime, before: Boolean) = {
-      val truncated = t.truncatedTo(unit)
-      if (before)
-        truncated
-      else if (truncated == t)
-        t
-      else
-        truncated.plus(1, unit)
-    }
-
-    val alignedStart = findBound(zonedStart, !conservative)
-    val alignedEnd = findBound(zonedEnd, conservative)
-
-    val periods = alignedStart.until(alignedEnd, unit)
-
-    (0L to (periods - 1)).grouped(maxPeriods).map { l =>
-      def alignedNth(k: Long) =
-        alignedStart
-          .plus(k, unit)
-          .withZoneSameInstant(UTC)
-          .toInstant
-
-      TimeSeriesContext(alignedNth(l.head), alignedNth(l.last + 1))
-    }
-  }
-
-  private[timeseries] def splitInterval(job: TimeSeriesJob, interval: Interval[Instant], mode: Boolean = true) = {
-    //val (unit, tz) = job.scheduling.grid match {
-    //  case Hourly => (HOURS, UTC)
-    //  case Daily(_tz) => (DAYS, _tz)
-    //  case Continuous => sys.error("panic!")
-    //}
-    //val Closed(start) = interval.lower.bound
-    //val Open(end) = interval.upper.bound
-    //val maxPeriods = if (mode) job.scheduling.maxPeriods else 1
-    //split(start, end, tz, unit, mode, maxPeriods)
-
-    List.empty
-  }
-
-  private[timeseries] def next(workflow0: Workflow[TimeSeries],
-                               state0: State,
-                               now: Instant): List[Executable] = {
+  private[timeseries] def next(workflow0: Workflow[TimeSeries], state0: State, now: Instant): List[Executable] = {
     val workflow = workflow0 dependsOn timer
     val timerInterval = IntervalMap(Interval(Bottom, Finite(now)) -> (Done: JobState))
     val state = state0 + (timer -> timerInterval)
 
-    // lazy val in Workflow?
-    val parentsMap = workflow.edges.groupBy { case (child, parent, _) => parent }
-    val childrenMap = workflow.edges.groupBy { case (child, parent, _) => child }
+    val parentsMap = workflow.edges.groupBy { case (child, parent, _) => child }
+    val childrenMap = workflow.edges.groupBy { case (child, parent, _) => parent }
 
     (for {
       job <- workflow0.vertices.toList
     } yield {
-      // cache _.collect { case Done => () }
       val dependenciesSatisfied = parentsMap(job)
         .map {
           case (_, parent, lbl) =>
             state(parent).mapKeys(_.plus(lbl.offset)).collect { case Done => () }
-        }.reduce (_ whenIsDef _)
-      val childrenRunning = childrenMap(job)
+        }
+        .reduce(_ whenIsDef _)
+      val noChildrenRunning = childrenMap.getOrElse(job, Set.empty)
         .map {
-        case (child, _, lbl) =>
-          state(child).mapKeys(_.minus(lbl.offset)).collect { case Running(_) => () }
-        }.reduce (_ whenIsDef _)
-      val toRun = state(job).collect { case Todo(maybeBackfill) => maybeBackfill }
-      .whenIsDef(dependenciesSatisfied)
-      .whenIsUndef(childrenRunning)
+          case (child, _, lbl) =>
+            state(child).mapKeys(_.minus(lbl.offset)).collect { case Running(_) => () }
+        }
+      .fold(IntervalMap(Interval.full[Instant] -> {()}))(_ whenIsUndef _)
+      val toRun = state(job)
+        .collect { case Todo(maybeBackfill) => maybeBackfill }
+        .whenIsDef(dependenciesSatisfied)
+        .whenIsDef(noChildrenRunning)
 
-      // val slots = getSlots(job.scheduling.grid, job.scheduling.maxPeriods).map(mkContext)
-      List.empty[Executable]
+      for {
+        (interval, maybeBackfill) <- toRun.toList
+        (lo, hi) <- job.scheduling.grid.inInterval(interval, job.scheduling.maxPeriods)
+      } yield {
+        (job, TimeSeriesContext(lo, hi, maybeBackfill))
+      }
     }).flatten
 
   }
@@ -306,6 +301,5 @@ private[timeseries] object TimeSeriesUtils {
   type Run = (TimeSeriesJob, TimeSeriesContext, Future[Unit])
   type State = Map[TimeSeriesJob, IntervalMap[Instant, JobState]]
 
-  val UTC: ZoneId = ZoneId.of("UTC")
-
+  val UTC = ZoneId.of("UTC")
 }

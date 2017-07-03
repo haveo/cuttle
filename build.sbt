@@ -206,8 +206,8 @@ lazy val timeseries =
   (project in file("timeseries"))
     .settings(commonSettings: _*)
     .settings(
-        logLevel := Level.Error
-      )
+      logLevel := Level.Error
+    )
     .dependsOn(cuttle % "compile->compile;test->test")
 
 lazy val examples =
